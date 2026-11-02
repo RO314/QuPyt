@@ -70,6 +70,31 @@ except ImportError:
         "Could not load NI-DAQ library".ljust(65, ".")
         + "[failed]\nIf you are not using a NI-DAQ you do not need this!"
     )
+try:
+    # The wrapper loads TUCam.dll from the Mosaic 3.1 installation on import.
+    from qupyt.hardware.wrappers.TUCam import (
+        TUCAM_INIT,
+        TUCAM_OPEN,
+        TUCAM_FRAME,
+        TUCAM_ELEMENT,
+        TUCAM_Api_Init,
+        TUCAM_Api_Uninit,
+        TUCAM_Dev_Open,
+        TUCAM_Dev_Close,
+        TUCAM_Buf_Alloc,
+        TUCAM_Buf_Release,
+        TUCAM_Buf_WaitForFrame,
+        TUCAM_Buf_AbortWait,
+        TUCAM_Cap_Start,
+        TUCAM_Cap_Stop,
+        TUCAM_GenICam_SetElementValue,
+        TUCAM_GenICam_GetElementValue,
+    )
+except (ImportError, OSError, NameError):
+    logging.warning(
+        "Could not load TUCam library".ljust(65, ".")
+        + "[failed]\nIf you are not using a TUCam camera you do not need this!"
+    )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.dirname(SCRIPT_DIR))
@@ -117,6 +142,8 @@ class SensorFactory:
                 return HeliCam(configuration)
             if sensor_type == "DAQ":
                 return DAQ(configuration)
+            if sensor_type == "TUCam":
+                return TUCamSensor(configuration)
             if sensor_type == "MockCam":
                 return MockCam(configuration)
             raise ValueError(
@@ -1252,3 +1279,161 @@ class MockCam(Sensor):
         """
         Passes since there is no device to close.
         """
+
+
+class TUCamSensor(Sensor):
+    """
+    Sensor class implementation for Tucsen (TUCam) GenICam GigE cameras.
+    Requires the TUCam SDK as shipped with Mosaic 3.1, installed in
+    the default location under Program Files.
+
+    Arguments:
+        - **configuration** (dict): Configuration dictionary. Keys will be used
+          to select setter methods from an attribute map dicionary to set
+          associated values.
+
+          Possible configuration values:
+            - **exposure_time** (int, µs): Defaults to 100000.
+            - **image_roi** (list[int]): Region Of Interest of the sensor in
+              the following format: [height, width, x_offset, y_offset].
+              All values are rounded down to multiples of 4.
+              Defaults to the full 2048 x 2448 sensor.
+
+          Note that these configuration attributes extend those from the
+          :class:`Sensor` base class.
+    """
+
+    def __init__(self, configuration: Dict[str, Any]) -> None:
+        super().__init__(configuration)
+        self.initial_configuration_dict = configuration
+
+        runtime_path = r"C:\Program Files\Mosaic3.1".encode("utf-8")
+        self.TUCAMINIT = TUCAM_INIT(0, runtime_path)
+        ret = TUCAM_Api_Init(ctypes.pointer(self.TUCAMINIT), 1000)
+        if ret.value != 0x00000001:  # TUCAMRET_SUCCESS
+            raise RuntimeError(f"TUCam init failed: {hex(ret.value)}")
+
+        self.TUCAMOPEN = TUCAM_OPEN(0, 0)
+        TUCAM_Dev_Open(ctypes.pointer(self.TUCAMOPEN))
+
+        self.m_frame = TUCAM_FRAME()
+        self.m_frame.pBuffer = 0
+        self.m_frame.ucFormatGet = 0x11  # TUFRM_FMT_USUAL
+        self.m_frame.uiRsdSize = 1
+
+        self.attribute_map["exposure_time"] = self._set_exposure_time
+        self.attribute_map["image_roi"] = self._set_roi
+
+        # Reset to full sensor to clear any stale ROI on the camera.
+        self._set_roi([2048, 2448, 0, 0])
+        self._set_exposure_time(100000)
+        if configuration is not None:
+            self._update_from_configuration(configuration)
+
+    def __repr__(self) -> str:
+        return f"TUCamSensor(configuration: {self.initial_configuration_dict})"
+
+    def __str__(self) -> str:
+        return f"TUCam camera instance: TUCamSensor(configuration: {self.initial_configuration_dict})"
+
+    def open(self) -> None:
+        """
+        Passes since the camera is opened in the constructor.
+        """
+
+    def _set_element(self, name: str, value: int) -> None:
+        element = TUCAM_ELEMENT()
+        element.pName = ctypes.c_char_p(name.encode("utf-8"))
+        element.uValue.Int64.nVal = int(value)
+        TUCAM_GenICam_SetElementValue(
+            self.TUCAMOPEN.hIdxTUCam, ctypes.pointer(element), 0
+        )
+
+    def _get_element_value(self, name: str) -> int:
+        element = TUCAM_ELEMENT()
+        element.pName = ctypes.c_char_p(name.encode("utf-8"))
+        TUCAM_GenICam_GetElementValue(
+            self.TUCAMOPEN.hIdxTUCam, ctypes.pointer(element), 0
+        )
+        return int(element.uValue.Int64.nVal)
+
+    def _set_roi(self, roi_shape_and_offset: List[int]) -> None:
+        """
+        Sets the ROI as [height, width, x_offset, y_offset].
+        Capture must be stopped and the buffer released before
+        the geometry can be changed.
+        """
+        height, width, x_offset, y_offset = roi_shape_and_offset
+        TUCAM_Cap_Stop(self.TUCAMOPEN.hIdxTUCam)
+        TUCAM_Buf_Release(self.TUCAMOPEN.hIdxTUCam)
+
+        self._set_element("Width", (width // 4) * 4)
+        self._set_element("Height", (height // 4) * 4)
+        self._set_element("OffsetX", (x_offset // 4) * 4)
+        self._set_element("OffsetY", (y_offset // 4) * 4)
+
+        TUCAM_Buf_Alloc(self.TUCAMOPEN.hIdxTUCam, ctypes.pointer(self.m_frame))
+
+        # Read back the values actually applied by the camera.
+        self.m_frame.usWidth = self._get_element_value("Width")
+        self.m_frame.usHeight = self._get_element_value("Height")
+        self.roi_shape = [self.m_frame.usHeight, self.m_frame.usWidth]
+        logging.info(
+            f"Set Sensor roi to height: {self.m_frame.usHeight} and width: {self.m_frame.usWidth}".ljust(
+                65, "."
+            )
+            + "[done]"
+        )
+
+    def _set_exposure_time(self, exposure_time: int) -> None:
+        self._set_element("ExposureTime", exposure_time)
+
+    def acquire_data(self, synchroniser: Optional[Synchroniser] = None) -> np.ndarray:
+        """
+        See :meth:`Sensor.acquire_data`.
+        """
+        time_1 = time()
+        TUCAM_Cap_Start(self.TUCAMOPEN.hIdxTUCam, 0x00)  # TUCCM_SEQUENCE
+        if synchroniser is not None:
+            synchroniser.trigger()
+
+        raw_frames = []
+        for _ in range(self.number_measurements):
+            ret = TUCAM_Buf_WaitForFrame(
+                self.TUCAMOPEN.hIdxTUCam, ctypes.pointer(self.m_frame), 5000
+            )
+            if ret.value == 0x00000001:  # TUCAMRET_SUCCESS
+                total_size = (
+                    self.m_frame.usHeader
+                    + self.m_frame.uiImgSize
+                    + self.m_frame.uiHstSize
+                )
+                raw_frames.append(ctypes.string_at(self.m_frame.pBuffer, total_size))
+
+        TUCAM_Buf_AbortWait(self.TUCAMOPEN.hIdxTUCam)
+        TUCAM_Cap_Stop(self.TUCAMOPEN.hIdxTUCam)
+
+        # Skip the frame header and keep only the uint16 pixel data.
+        height, width = self.m_frame.usHeight, self.m_frame.usWidth
+        header_offset = self.m_frame.usHeader
+        arr = np.zeros((self.number_measurements, height, width), dtype=np.uint16)
+        for i, buf in enumerate(raw_frames):
+            img_data = buf[header_offset: header_offset + width * height * 2]
+            frame = np.frombuffer(img_data, dtype=np.uint16).reshape((height, width))
+            arr[i] = np.flipud(frame)  # frames arrive bottom-up
+        time_2 = time()
+        logging.info(
+            f"TUCam data acquisition took {time_2-time_1} s".ljust(
+                65, ".") + "[done]"
+        )
+        return arr
+
+    def close(self) -> None:
+        """
+        See :meth:`Sensor.close`
+        """
+        TUCAM_Cap_Stop(self.TUCAMOPEN.hIdxTUCam)
+        TUCAM_Buf_Release(self.TUCAMOPEN.hIdxTUCam)
+        TUCAM_Dev_Close(self.TUCAMOPEN.hIdxTUCam)
+        TUCAM_Api_Uninit()
+        logging.info("TUCam closed".ljust(65, "."))
