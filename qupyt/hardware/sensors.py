@@ -1298,6 +1298,9 @@ class TUCamSensor(Sensor):
               the following format: [height, width, x_offset, y_offset].
               All values are rounded down to multiples of 4.
               Defaults to the full 2048 x 2448 sensor.
+            - **camera_index** (int): Index of the camera in the TUCam SDK's
+              device list. Only used when the camera is opened. Defaults to
+              the first camera that can be opened.
 
           Note that these configuration attributes extend those from the
           :class:`Sensor` base class.
@@ -1313,8 +1316,8 @@ class TUCamSensor(Sensor):
         if ret.value != 0x00000001:  # TUCAMRET_SUCCESS
             raise RuntimeError(f"TUCam init failed: {hex(ret.value)}")
 
-        self.TUCAMOPEN = TUCAM_OPEN(0, 0)
-        TUCAM_Dev_Open(ctypes.pointer(self.TUCAMOPEN))
+        camera_index = (configuration or {}).get("camera_index")
+        self._open_camera(camera_index)
 
         self.m_frame = TUCAM_FRAME()
         self.m_frame.pBuffer = 0
@@ -1323,6 +1326,8 @@ class TUCamSensor(Sensor):
 
         self.attribute_map["exposure_time"] = self._set_exposure_time
         self.attribute_map["image_roi"] = self._set_roi
+        # Consumed by _open_camera above, cannot be changed afterwards.
+        self.attribute_map["camera_index"] = lambda x: None
 
         # Reset to full sensor to clear any stale ROI on the camera.
         self._set_roi([2048, 2448, 0, 0])
@@ -1340,6 +1345,36 @@ class TUCamSensor(Sensor):
         """
         Passes since the camera is opened in the constructor.
         """
+
+    def _open_camera(self, camera_index: Optional[int]) -> None:
+        """
+        Opens the camera at camera_index, or the first camera that can be
+        opened if camera_index is None. Machines can list devices that
+        cannot be opened, so the open result has to be checked. If no
+        camera opens, the SDK is released again so a new instance can
+        initialise it.
+        """
+        n_cameras = self.TUCAMINIT.uiCamCount
+        indices = range(n_cameras) if camera_index is None else [camera_index]
+        for index in indices:
+            self.TUCAMOPEN = TUCAM_OPEN(index, 0)
+            ret = TUCAM_Dev_Open(ctypes.pointer(self.TUCAMOPEN))
+            if ret.value == 0x00000001 and self.TUCAMOPEN.hIdxTUCam:  # TUCAMRET_SUCCESS
+                logging.info(
+                    f"Opened TUCam camera index {index} of {n_cameras}".ljust(65, ".")
+                    + "[done]"
+                )
+                return
+            logging.warning(
+                f"Could not open TUCam camera index {index}: {hex(ret.value)}".ljust(65, ".")
+                + "[failed]"
+            )
+        TUCAM_Api_Uninit()
+        raise RuntimeError(
+            f"Could not open a TUCam camera (camera_index: {camera_index}, "
+            f"cameras found: {n_cameras}). Check that the camera is connected "
+            "and not in use by Mosaic or another Python process."
+        )
 
     def _set_element(self, name: str, value: int) -> None:
         element = TUCAM_ELEMENT()
